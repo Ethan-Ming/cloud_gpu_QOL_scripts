@@ -2,16 +2,25 @@
 # =============================================================================
 # Wan2GP Vast.ai Provisioning
 #
-# Automatic GPU/environment detection
-# Automatic Python / PyTorch / CUDA environment selection
-# Automatic SageAttention installation
-# Automatic INT4/FP4 kernel installation
+# Goals:
+#   - Automatically detect GPU
+#   - Automatically select a compatible Python / PyTorch / CUDA environment
+#   - Repair CUDA-toolkit / PyTorch CUDA mismatches automatically
+#   - Install SageAttention automatically
+#   - Install INT4/FP4 acceleration only when actually required
+#   - Preserve already-working INT4/FP4 packages in the original Vast env
+#   - Never switch Python environments after environment selection
+#   - No model pre-seeding
+#   - All model weights are downloaded ON-DEMAND through finetune JSONs
 #
-# Models are NOT pre-seeded.
-# All model weights are downloaded through WanGP finetune JSONs on demand.
-#
-# Based on current WanGP:
+# Current WanGP reference:
 #   https://github.com/deepbeepmeep/Wan2GP
+#
+# Current WanGP setup_config:
+#   Python 3.11.14 recommended
+#   Torch 2.10.0 + CUDA 13.0
+#   SageAttention 2.2.0 CUDA 13
+#
 # =============================================================================
 
 set -euo pipefail
@@ -23,18 +32,46 @@ set -euo pipefail
 
 WANGP_DIR="/workspace/Wan2GP"
 WANGP_ENV="/venv/wan2gp"
+WANGP_ENV_NAME="wan2gp"
 
-LAUNCH_FILE="/opt/supervisor-scripts/wan2gp.sh"
+ORIGINAL_ENV="/venv/main"
 
 WANGP_REPO="https://github.com/deepbeepmeep/Wan2GP.git"
 
-TORCH_INDEX="https://download.pytorch.org/whl/cu130"
+SUPERVISOR_FILE="/opt/supervisor-scripts/wan2gp.sh"
 
-TORCH_PACKAGES="torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0"
+TORCH_INDEX_CU130="https://download.pytorch.org/whl/cu130"
+TORCH_INDEX_CU128="https://download.pytorch.org/whl/cu128"
+
+TORCH_CU130="torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0"
+TORCH_CU128="torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1"
+
+# NVIDIA's CUDA 13.0 Python packages.
+#
+# We only install these when the selected environment does not already have
+# a usable CUDA 13.0 toolkit.
+CUDA_NVCC_PACKAGE="nvidia-cuda-nvcc==13.0.88"
+CUDA_RUNTIME_PACKAGE="nvidia-cuda-runtime==13.0.96"
+CUDA_CCCL_PACKAGE="nvidia-cuda-cccl==13.0.85"
+
+# SageAttention repository.
+SAGE_REPO="https://github.com/thu-ml/SageAttention.git"
+
+# RTX 50 / 40 / 30:
+SAGE2_REQUIRED="2.2.0"
+
+# RTX 20:
+SAGE1_REQUIRED="1.0.6"
+
+# Nunchaku wheel currently used by WanGP for the CUDA 13 / Torch 2.10 stack.
+NUNCHAKU_WHEEL="https://github.com/nunchaku-ai/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1+cu13.0torch2.10-cp311-cp311-linux_x86_64.whl"
+
+# LightX2V NVFP4 kernel.
+LIGHT2XV_WHEEL="https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl"
 
 
 # =============================================================================
-# Helper functions
+# Logging
 # =============================================================================
 
 log() {
@@ -44,68 +81,101 @@ log() {
     echo "============================================================"
 }
 
+info() {
+    echo "[INFO] $1"
+}
+
+ok() {
+    echo "[OK] $1"
+}
+
+warn() {
+    echo "[WARN] $1"
+}
+
 die() {
     echo
     echo "[ERROR] $1"
+    echo
     exit 1
 }
+
+
+# =============================================================================
+# Basic requirements
+# =============================================================================
+
+command -v git >/dev/null 2>&1 || die "git is not installed."
+
+command -v nvidia-smi >/dev/null 2>&1 || \
+    die "nvidia-smi was not found. NVIDIA GPU required."
 
 
 # =============================================================================
 # 0. Detect GPU
 # =============================================================================
 
-log "[0/8] Detecting GPU"
+log "[0/9] Detecting GPU"
 
+GPU_NAME="$(
+    nvidia-smi \
+        --query-gpu=name \
+        --format=csv,noheader \
+        2>/dev/null |
+        head -n1 |
+        xargs
+)"
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-    die "nvidia-smi not found. This script currently supports NVIDIA GPUs only."
-fi
+GPU_CC="$(
+    nvidia-smi \
+        --query-gpu=compute_cap \
+        --format=csv,noheader \
+        2>/dev/null |
+        head -n1 |
+        xargs || true
+)"
 
+GPU_DRIVER="$(
+    nvidia-smi \
+        --query-gpu=driver_version \
+        --format=csv,noheader \
+        2>/dev/null |
+        head -n1 |
+        xargs || true
+)"
 
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | xargs || true)"
-
-GPU_CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | xargs || true)"
-
-GPU_DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | xargs || true)"
-
+[ -n "${GPU_NAME}" ] || die "Could not determine GPU."
 
 echo "GPU:          ${GPU_NAME}"
-echo "Compute Cap:  ${GPU_CC}"
-echo "Driver:       ${GPU_DRIVER}"
-
-
-if [[ -z "${GPU_NAME}" ]]; then
-    die "Could not determine GPU."
-fi
+echo "Compute Cap:  ${GPU_CC:-unknown}"
+echo "Driver:       ${GPU_DRIVER:-unknown}"
 
 
 # =============================================================================
-# Determine GPU generation
+# GPU profile
 # =============================================================================
 
 GPU_PROFILE=""
 
-
 case "${GPU_NAME}" in
 
-    *RTX\ 50*|*RTX\ PRO\ 50*)
+    *"RTX 50"*|*"RTX PRO 50"*)
         GPU_PROFILE="RTX_50"
         ;;
 
-    *RTX\ 40*|*RTX\ PRO\ 40*)
+    *"RTX 40"*|*"RTX PRO 40"*)
         GPU_PROFILE="RTX_40"
         ;;
 
-    *RTX\ 30*|*RTX\ A*|*A10*|*A40*)
+    *"RTX 30"*|*"RTX A"*|*"A10"*|*"A40"*)
         GPU_PROFILE="RTX_30"
         ;;
 
-    *RTX\ 20*|*T4*|*Quadro\ RTX*)
+    *"RTX 20"*|*"T4"*|*"Quadro RTX"*)
         GPU_PROFILE="RTX_20"
         ;;
 
-    *GTX\ 10*|*P40*|*P100*)
+    *"GTX 10"*|*"P40"*|*"P100"*)
         GPU_PROFILE="GTX_10"
         ;;
 
@@ -116,14 +186,18 @@ case "${GPU_NAME}" in
 esac
 
 
-echo "WanGP GPU profile: ${GPU_PROFILE}"
-
-
 # =============================================================================
-# Determine package profile
-#
-# Mirrors current WanGP setup_config.json.
+# Select WanGP acceleration profile
 # =============================================================================
+
+PYTHON_MAJOR=""
+TORCH_SPEC=""
+TORCH_INDEX_URL=""
+SAGE_REQUIRED="none"
+ATTENTION_MODE=""
+NUNCHAKU_REQUIRED="no"
+LIGHT2XV_REQUIRED="no"
+TRITON_REQUIRED="no"
 
 case "${GPU_PROFILE}" in
 
@@ -131,15 +205,15 @@ case "${GPU_PROFILE}" in
 
         PYTHON_MAJOR="3.11"
 
-        TORCH_SPEC="${TORCH_PACKAGES}"
-        TORCH_INDEX_URL="${TORCH_INDEX}"
+        TORCH_SPEC="${TORCH_CU130}"
+        TORCH_INDEX_URL="${TORCH_INDEX_CU130}"
 
-        TRITON_SPEC="triton"
+        TRITON_REQUIRED="yes"
 
-        SAGE_REQUIRED="2.2.0"
+        SAGE_REQUIRED="${SAGE2_REQUIRED}"
+        ATTENTION_MODE="sage2"
 
         NUNCHAKU_REQUIRED="yes"
-
         LIGHT2XV_REQUIRED="yes"
 
         ;;
@@ -148,15 +222,15 @@ case "${GPU_PROFILE}" in
 
         PYTHON_MAJOR="3.11"
 
-        TORCH_SPEC="${TORCH_PACKAGES}"
-        TORCH_INDEX_URL="${TORCH_INDEX}"
+        TORCH_SPEC="${TORCH_CU130}"
+        TORCH_INDEX_URL="${TORCH_INDEX_CU130}"
 
-        TRITON_SPEC="triton"
+        TRITON_REQUIRED="yes"
 
-        SAGE_REQUIRED="2.2.0"
+        SAGE_REQUIRED="${SAGE2_REQUIRED}"
+        ATTENTION_MODE="sage2"
 
         NUNCHAKU_REQUIRED="yes"
-
         LIGHT2XV_REQUIRED="no"
 
         ;;
@@ -165,15 +239,15 @@ case "${GPU_PROFILE}" in
 
         PYTHON_MAJOR="3.11"
 
-        TORCH_SPEC="${TORCH_PACKAGES}"
-        TORCH_INDEX_URL="${TORCH_INDEX}"
+        TORCH_SPEC="${TORCH_CU130}"
+        TORCH_INDEX_URL="${TORCH_INDEX_CU130}"
 
-        TRITON_SPEC="triton"
+        TRITON_REQUIRED="yes"
 
-        SAGE_REQUIRED="2.2.0"
+        SAGE_REQUIRED="${SAGE2_REQUIRED}"
+        ATTENTION_MODE="sage2"
 
         NUNCHAKU_REQUIRED="yes"
-
         LIGHT2XV_REQUIRED="no"
 
         ;;
@@ -182,15 +256,15 @@ case "${GPU_PROFILE}" in
 
         PYTHON_MAJOR="3.11"
 
-        TORCH_SPEC="${TORCH_PACKAGES}"
-        TORCH_INDEX_URL="${TORCH_INDEX}"
+        TORCH_SPEC="${TORCH_CU130}"
+        TORCH_INDEX_URL="${TORCH_INDEX_CU130}"
 
-        TRITON_SPEC="triton"
+        TRITON_REQUIRED="yes"
 
-        SAGE_REQUIRED="1.0.6"
+        SAGE_REQUIRED="${SAGE1_REQUIRED}"
+        ATTENTION_MODE="sage"
 
         NUNCHAKU_REQUIRED="yes"
-
         LIGHT2XV_REQUIRED="no"
 
         ;;
@@ -199,16 +273,15 @@ case "${GPU_PROFILE}" in
 
         PYTHON_MAJOR="3.10"
 
-        TORCH_SPEC="torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1"
+        TORCH_SPEC="${TORCH_CU128}"
+        TORCH_INDEX_URL="${TORCH_INDEX_CU128}"
 
-        TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
-
-        TRITON_SPEC=""
+        TRITON_REQUIRED="no"
 
         SAGE_REQUIRED="none"
+        ATTENTION_MODE="sdpa"
 
         NUNCHAKU_REQUIRED="no"
-
         LIGHT2XV_REQUIRED="no"
 
         ;;
@@ -217,43 +290,46 @@ esac
 
 
 echo
-echo "Selected environment:"
-echo "  Python:       ${PYTHON_MAJOR}"
-echo "  PyTorch:      ${TORCH_SPEC}"
-echo "  CUDA wheel:   ${TORCH_INDEX_URL}"
-echo "  Triton:       ${TRITON_SPEC}"
-echo "  Sage:         ${SAGE_REQUIRED}"
-echo "  Nunchaku:     ${NUNCHAKU_REQUIRED}"
-echo "  Light2xv:     ${LIGHT2XV_REQUIRED}"
+echo "Selected WanGP profile:"
+echo "  GPU profile:       ${GPU_PROFILE}"
+echo "  Python:            ${PYTHON_MAJOR}"
+echo "  PyTorch:           ${TORCH_SPEC}"
+echo "  Torch index:       ${TORCH_INDEX_URL}"
+echo "  SageAttention:     ${SAGE_REQUIRED}"
+echo "  Attention mode:    ${ATTENTION_MODE}"
+echo "  Triton:            ${TRITON_REQUIRED}"
+echo "  Nunchaku:          ${NUNCHAKU_REQUIRED}"
+echo "  Light2xv:           ${LIGHT2XV_REQUIRED}"
 
 
 # =============================================================================
-# 1. Stop existing Wan2GP
+# 1. Stop existing WanGP
 # =============================================================================
 
-log "[1/8] Stopping existing Wan2GP"
+log "[1/9] Stopping existing WanGP"
 
-supervisorctl stop wan2gp || true
+supervisorctl stop wan2gp >/dev/null 2>&1 || true
 
 
 # =============================================================================
-# 2. Clone / update Wan2GP
+# 2. Update WanGP
 # =============================================================================
 
-log "[2/8] Updating Wan2GP"
-
+log "[2/9] Updating WanGP"
 
 if [ ! -d "${WANGP_DIR}/.git" ]; then
 
-    echo "Cloning Wan2GP..."
+    info "Cloning WanGP..."
 
     mkdir -p "$(dirname "${WANGP_DIR}")"
 
-    git clone "${WANGP_REPO}" "${WANGP_DIR}"
+    git clone \
+        "${WANGP_REPO}" \
+        "${WANGP_DIR}"
 
 else
 
-    echo "Updating existing Wan2GP..."
+    info "Updating existing WanGP..."
 
     cd "${WANGP_DIR}"
 
@@ -263,219 +339,298 @@ else
 
 fi
 
-
 cd "${WANGP_DIR}"
 
-echo "WanGP commit:"
-git rev-parse --short HEAD
+WANGP_COMMIT="$(git rev-parse --short HEAD)"
+
+echo "WanGP commit: ${WANGP_COMMIT}"
 
 
 # =============================================================================
-# 3. Prepare Python environment
+# 3. Inspect ORIGINAL Vast environment BEFORE changing anything
 # =============================================================================
 
-log "[3/8] Preparing Python environment"
+log "[3/9] Inspecting original Vast environment"
+
+ORIGINAL_PYTHON="missing"
+ORIGINAL_TORCH="missing"
+ORIGINAL_TORCH_CUDA="missing"
+ORIGINAL_NVCC="missing"
+
+ORIGINAL_NUNCHAKU="no"
+ORIGINAL_LIGHT2XV="no"
 
 
-# -----------------------------------------------------------------------------
-# First inspect Vast's existing environment
-# -----------------------------------------------------------------------------
+if [ -x "${ORIGINAL_ENV}/bin/python" ]; then
 
-echo "Checking existing /venv/main..."
+    echo "Original environment: ${ORIGINAL_ENV}"
 
-if [ -x "/venv/main/bin/python" ]; then
+    ORIGINAL_PYTHON="$(
+        "${ORIGINAL_ENV}/bin/python" \
+            -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' \
+            2>/dev/null ||
+        echo "missing"
+    )"
 
-    /venv/main/bin/python - <<'PY'
-try:
-    import torch
+    ORIGINAL_TORCH="$(
+        "${ORIGINAL_ENV}/bin/python" \
+            -c 'import torch; print(torch.__version__)' \
+            2>/dev/null ||
+        echo "missing"
+    )"
 
-    print("Existing Python:", __import__("sys").version.split()[0])
-    print("Existing Torch:", torch.__version__)
-    print("Existing Torch CUDA:", torch.version.cuda)
+    ORIGINAL_TORCH_CUDA="$(
+        "${ORIGINAL_ENV}/bin/python" \
+            -c 'import torch; print(torch.version.cuda)' \
+            2>/dev/null ||
+        echo "missing"
+    )"
 
-except Exception as e:
-    print("Could not inspect existing Torch:", e)
-PY
+    echo "  Python:       ${ORIGINAL_PYTHON}"
+    echo "  PyTorch:      ${ORIGINAL_TORCH}"
+    echo "  Torch CUDA:   ${ORIGINAL_TORCH_CUDA}"
 
 else
 
-    echo "/venv/main does not exist."
+    info "/venv/main does not exist."
 
 fi
 
 
-# -----------------------------------------------------------------------------
-# Find conda
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Detect original environment's CUDA toolkit
+# =============================================================================
 
-CONDA_BIN=""
+if [ -x "${ORIGINAL_ENV}/bin/nvcc" ]; then
 
-if command -v conda >/dev/null 2>&1; then
+    ORIGINAL_NVCC="$(
+        "${ORIGINAL_ENV}/bin/nvcc" --version 2>/dev/null |
+        grep -oE 'release [0-9]+\.[0-9]+' |
+        head -n1 |
+        awk '{print $2}' ||
+        echo "missing"
+    )
 
-    CONDA_BIN="$(command -v conda)"
+elif command -v nvcc >/dev/null 2>&1; then
 
-elif [ -x "/opt/conda/bin/conda" ]; then
-
-    CONDA_BIN="/opt/conda/bin/conda"
-
-elif [ -x "/root/miniconda3/bin/conda" ]; then
-
-    CONDA_BIN="/root/miniconda3/bin/conda"
+    ORIGINAL_NVCC="$(
+        nvcc --version 2>/dev/null |
+        grep -oE 'release [0-9]+\.[0-9]+' |
+        head -n1 |
+        awk '{print $2}' ||
+        echo "missing"
+    )"
 
 fi
 
-
-# -----------------------------------------------------------------------------
-# We need Python 3.11 for RTX 20-50.
-#
-# If Vast's environment is already compatible, reuse it.
-# Otherwise create an isolated conda environment.
-# -----------------------------------------------------------------------------
-
-USE_EXISTING_ENV="no"
+echo "  System nvcc:  ${ORIGINAL_NVCC}"
 
 
-if [ -x "/venv/main/bin/python" ]; then
+# =============================================================================
+# Check original Nunchaku
+# =============================================================================
 
-    EXISTING_PYTHON="$(
-        /venv/main/bin/python -c \
-        'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' \
-        2>/dev/null || echo "unknown"
-    )"
+if [ -x "${ORIGINAL_ENV}/bin/python" ]; then
 
-    EXISTING_TORCH="$(
-        /venv/main/bin/python -c \
-        'import torch; print(torch.__version__)' \
-        2>/dev/null || echo "missing"
-    )"
+    if "${ORIGINAL_ENV}/bin/python" \
+        -c 'import nunchaku' >/dev/null 2>&1
+    then
 
-    EXISTING_CUDA="$(
-        /venv/main/bin/python -c \
-        'import torch; print(torch.version.cuda)' \
-        2>/dev/null || echo "missing"
-    )"
+        ORIGINAL_NUNCHAKU="yes"
 
-
-    if [ "${EXISTING_PYTHON}" = "${PYTHON_MAJOR}" ] && \
-       [[ "${EXISTING_TORCH}" == 2.10.* ]] && \
-       [ "${EXISTING_CUDA}" = "13.0" ]; then
-
-        echo "[OK] Existing Vast environment already matches."
-        USE_EXISTING_ENV="yes"
+        ok "Nunchaku already exists in original Vast environment."
 
     else
 
-        echo "[INFO] Existing environment does not match WanGP profile."
-
-        echo "       Python: ${EXISTING_PYTHON}"
-        echo "       Torch:  ${EXISTING_TORCH}"
-        echo "       CUDA:   ${EXISTING_CUDA}"
+        info "Nunchaku is not importable in original Vast environment."
 
     fi
 
 fi
 
 
-# -----------------------------------------------------------------------------
-# Create isolated environment if required
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Check original Light2xv
+# =============================================================================
 
-if [ "${USE_EXISTING_ENV}" = "yes" ]; then
+if [ "${LIGHT2XV_REQUIRED}" = "yes" ] &&
+   [ -x "${ORIGINAL_ENV}/bin/python" ]
+then
 
-    WANGP_PYTHON="/venv/main/bin/python"
+    if "${ORIGINAL_ENV}/bin/python" \
+        -c 'import lightx2v' >/dev/null 2>&1
+    then
 
-else
+        ORIGINAL_LIGHT2XV="yes"
 
-    if [ -z "${CONDA_BIN}" ]; then
+        ok "Light2xv already exists in original Vast environment."
 
-        die "WanGP needs Python ${PYTHON_MAJOR}, but no compatible existing environment or Conda installation was found."
+    else
+
+        info "Light2xv is not importable in original Vast environment."
 
     fi
 
-
-    echo "Creating isolated WanGP environment:"
-    echo "  ${WANGP_ENV}"
+fi
 
 
-    # Initialize conda for this shell.
+# =============================================================================
+# Decide whether /venv/main is safe to reuse
+#
+# IMPORTANT:
+# We only reuse the original environment if the COMPLETE Python/Torch stack
+# matches the selected WanGP profile.
+#
+# If not, create a clean isolated environment.
+# =============================================================================
+
+USE_ORIGINAL_ENV="no"
+
+
+if [ -x "${ORIGINAL_ENV}/bin/python" ]; then
+
+    if [ "${ORIGINAL_PYTHON}" = "${PYTHON_MAJOR}" ] &&
+       [ "${ORIGINAL_TORCH_CUDA}" = "13.0" ] &&
+       [[ "${ORIGINAL_TORCH}" == 2.10.* ]]
+    then
+
+        USE_ORIGINAL_ENV="yes"
+
+        ok "Original Vast Python/Torch environment matches WanGP profile."
+
+    else
+
+        warn "Original Vast environment does NOT match the required profile."
+
+        echo
+        echo "Required:"
+        echo "  Python:       ${PYTHON_MAJOR}"
+        echo "  PyTorch:      2.10.x"
+        echo "  Torch CUDA:   13.0"
+        echo
+        echo "Detected:"
+        echo "  Python:       ${ORIGINAL_PYTHON}"
+        echo "  PyTorch:      ${ORIGINAL_TORCH}"
+        echo "  Torch CUDA:   ${ORIGINAL_TORCH_CUDA}"
+        echo
+        echo "A clean isolated WanGP environment will be used."
+
+    fi
+
+fi
+
+
+# =============================================================================
+# Select Python environment ONCE
+# =============================================================================
+
+if [ "${USE_ORIGINAL_ENV}" = "yes" ]; then
+
+    WANGP_PYTHON="${ORIGINAL_ENV}/bin/python"
+    WANGP_ENV_ROOT="${ORIGINAL_ENV}"
+
+else
+
+    log "Creating isolated WanGP Python environment"
+
+    CONDA_BIN=""
+
+    if command -v conda >/dev/null 2>&1; then
+        CONDA_BIN="$(command -v conda)"
+    elif [ -x "/opt/conda/bin/conda" ]; then
+        CONDA_BIN="/opt/conda/bin/conda"
+    elif [ -x "/root/miniconda3/bin/conda" ]; then
+        CONDA_BIN="/root/miniconda3/bin/conda"
+    fi
+
+    [ -n "${CONDA_BIN}" ] || \
+        die "No compatible /venv/main and no Conda installation was found."
+
     CONDA_BASE="$(
-        dirname \
-        "$(dirname "${CONDA_BIN}")"
+        dirname "$(dirname "${CONDA_BIN}")"
     )"
-
 
     # shellcheck disable=SC1091
     source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
+    if conda env list |
+        awk '{print $1}' |
+        grep -qx "${WANGP_ENV_NAME}"
+    then
 
-    ENV_NAME="wan2gp"
-
-    if conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
-
-        echo "[INFO] Conda environment ${ENV_NAME} already exists."
+        info "Conda environment ${WANGP_ENV_NAME} already exists."
 
     else
 
-        echo "[INFO] Creating Python ${PYTHON_MAJOR} environment..."
+        info "Creating Python ${PYTHON_MAJOR} environment..."
 
         conda create \
             -y \
-            -n "${ENV_NAME}" \
+            -n "${WANGP_ENV_NAME}" \
             "python=${PYTHON_MAJOR}"
 
     fi
 
-
-    conda activate "${ENV_NAME}"
+    conda activate "${WANGP_ENV_NAME}"
 
     WANGP_PYTHON="$(which python)"
+    WANGP_ENV_ROOT="$(dirname "$(dirname "${WANGP_PYTHON}")")"
 
 fi
 
 
+# =============================================================================
+# LOCK THE ENVIRONMENT
+#
+# From this point onward WANGP_PYTHON NEVER CHANGES.
+# =============================================================================
+
+export WANGP_PYTHON
+export WANGP_ENV_ROOT
+
 echo
-echo "Using Python:"
-echo "  ${WANGP_PYTHON}"
+echo "============================================================"
+echo "LOCKED WanGP environment"
+echo "============================================================"
+echo "Python: ${WANGP_PYTHON}"
+echo "Root:   ${WANGP_ENV_ROOT}"
+echo "============================================================"
 
 "${WANGP_PYTHON}" --version
 
 
 # =============================================================================
-# 4. Install / repair PyTorch + acceleration stack
+# 4. Install / repair PyTorch
 # =============================================================================
 
-log "[4/8] Installing acceleration stack"
+log "[4/9] Installing / repairing PyTorch"
+
+CURRENT_TORCH="$(
+    "${WANGP_PYTHON}" \
+        -c 'import torch; print(torch.__version__)' \
+        2>/dev/null ||
+    echo "missing"
+)"
+
+CURRENT_TORCH_CUDA="$(
+    "${WANGP_PYTHON}" \
+        -c 'import torch; print(torch.version.cuda)' \
+        2>/dev/null ||
+    echo "missing"
+)"
 
 
-# -----------------------------------------------------------------------------
-# PyTorch
-# -----------------------------------------------------------------------------
+if [ "${GPU_PROFILE}" = "GTX_10" ]; then
 
-if [ "${GPU_PROFILE}" != "GTX_10" ]; then
+    if [[ "${CURRENT_TORCH}" == 2.7.1* ]] &&
+       [ "${CURRENT_TORCH_CUDA}" = "12.8" ]
+    then
 
-    echo "Checking PyTorch..."
-
-    CURRENT_TORCH="$(
-        "${WANGP_PYTHON}" -c \
-        'import torch; print(torch.__version__)' \
-        2>/dev/null || echo "missing"
-    )
-
-    CURRENT_CUDA="$(
-        "${WANGP_PYTHON}" -c \
-        'import torch; print(torch.version.cuda)' \
-        2>/dev/null || echo "missing"
-    )
-
-
-    if [[ "${CURRENT_TORCH}" == 2.10.* ]] && \
-       [ "${CURRENT_CUDA}" = "13.0" ]; then
-
-        echo "[OK] PyTorch 2.10 + CUDA 13 already installed."
+        ok "PyTorch 2.7.1 + CUDA 12.8 already installed."
 
     else
 
-        echo "[INFO] Installing WanGP recommended PyTorch..."
+        info "Installing PyTorch 2.7.1 + CUDA 12.8..."
 
         "${WANGP_PYTHON}" -m pip install \
             --upgrade \
@@ -486,17 +641,15 @@ if [ "${GPU_PROFILE}" != "GTX_10" ]; then
 
 else
 
-    CURRENT_TORCH="$(
-        "${WANGP_PYTHON}" -c \
-        'import torch; print(torch.__version__)' \
-        2>/dev/null || echo "missing"
-    )
+    if [[ "${CURRENT_TORCH}" == 2.10.* ]] &&
+       [ "${CURRENT_TORCH_CUDA}" = "13.0" ]
+    then
 
-    if [[ "${CURRENT_TORCH}" == 2.7.1* ]]; then
-
-        echo "[OK] PyTorch 2.7.1 already installed."
+        ok "PyTorch 2.10 + CUDA 13.0 already installed."
 
     else
+
+        info "Installing PyTorch 2.10 + CUDA 13.0..."
 
         "${WANGP_PYTHON}" -m pip install \
             --upgrade \
@@ -508,9 +661,9 @@ else
 fi
 
 
-# -----------------------------------------------------------------------------
-# Verify Torch before compiling kernels
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Verify CUDA runtime
+# =============================================================================
 
 "${WANGP_PYTHON}" - <<'PY'
 
@@ -518,81 +671,370 @@ import torch
 
 print()
 print("PyTorch:", torch.__version__)
-print("Torch CUDA:", torch.version.cuda)
+print("PyTorch CUDA:", torch.version.cuda)
 print("CUDA available:", torch.cuda.is_available())
 
 if torch.cuda.is_available():
+
     print("GPU:", torch.cuda.get_device_name(0))
     print("Compute capability:", torch.cuda.get_device_capability(0))
 
 PY
 
 
-# -----------------------------------------------------------------------------
-# Triton
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Install WanGP requirements
+# =============================================================================
 
-if [ -n "${TRITON_SPEC}" ]; then
-
-    echo
-    echo "Checking Triton..."
-
-    if "${WANGP_PYTHON}" -c "import triton" >/dev/null 2>&1; then
-
-        TRITON_VERSION="$(
-            "${WANGP_PYTHON}" -c \
-            'import triton; print(triton.__version__)'
-        )
-
-        echo "[OK] Triton ${TRITON_VERSION} already installed."
-
-    else
-
-        echo "[INFO] Installing Triton..."
-
-        "${WANGP_PYTHON}" -m pip install -U "${TRITON_SPEC}"
-
-    fi
-
-fi
-
-
-# -----------------------------------------------------------------------------
-# WanGP requirements
-# -----------------------------------------------------------------------------
-
-echo
-echo "Installing WanGP Python requirements..."
+info "Installing WanGP requirements..."
 
 "${WANGP_PYTHON}" -m pip install \
     -r "${WANGP_DIR}/requirements.txt"
 
 
 # =============================================================================
-# 5. SageAttention
+# Triton
 # =============================================================================
 
-log "[5/8] Installing / verifying SageAttention"
+if [ "${TRITON_REQUIRED}" = "yes" ]; then
+
+    if "${WANGP_PYTHON}" \
+        -c 'import triton' >/dev/null 2>&1
+    then
+
+        TRITON_VERSION="$(
+            "${WANGP_PYTHON}" \
+                -c 'import triton; print(triton.__version__)'
+        )"
+
+        ok "Triton ${TRITON_VERSION} already installed."
+
+    else
+
+        info "Installing Triton..."
+
+        "${WANGP_PYTHON}" -m pip install -U triton
+
+    fi
+
+fi
+
+
+# =============================================================================
+# 5. CUDA TOOLKIT / NVCC MATCHING
+#
+# This is the important fix for the failure you encountered:
+#
+#   Detected CUDA 13.2
+#   PyTorch compiled with CUDA 12.8
+#
+# We never compile Sage until torch.version.cuda == nvcc release.
+#
+# For CUDA 13.0, if the system toolkit is missing or mismatched, install the
+# matching NVIDIA CUDA compiler/runtime into the selected Python environment.
+# =============================================================================
+
+log "[5/9] Checking CUDA toolkit / PyTorch CUDA compatibility"
+
+
+TORCH_CUDA="$(
+    "${WANGP_PYTHON}" \
+        -c 'import torch; print(torch.version.cuda)' \
+        2>/dev/null ||
+    echo "missing"
+)"
+
+
+SYSTEM_NVCC=""
+
+if command -v nvcc >/dev/null 2>&1; then
+
+    SYSTEM_NVCC="$(
+        nvcc --version 2>/dev/null |
+        grep -oE 'release [0-9]+\.[0-9]+' |
+        head -n1 |
+        awk '{print $2}' ||
+        echo ""
+    )"
+
+fi
+
+
+echo "PyTorch CUDA: ${TORCH_CUDA}"
+echo "System nvcc:  ${SYSTEM_NVCC:-not found}"
+
+
+CUDA_HOME_SELECTED=""
+
+
+# -----------------------------------------------------------------------------
+# First preference:
+# Existing system toolkit that exactly matches PyTorch.
+# -----------------------------------------------------------------------------
+
+if [ -n "${SYSTEM_NVCC}" ] &&
+   [ "${SYSTEM_NVCC}" = "${TORCH_CUDA}" ]
+then
+
+    CUDA_HOME_SELECTED="$(
+        dirname "$(dirname "$(command -v nvcc)")"
+    )"
+
+    ok "System CUDA toolkit matches PyTorch CUDA ${TORCH_CUDA}."
+
+fi
+
+
+# -----------------------------------------------------------------------------
+# If system CUDA doesn't match, install a matching CUDA toolkit into the
+# selected environment.
+#
+# We currently target CUDA 13.0 for RTX 20-50.
+# -----------------------------------------------------------------------------
+
+if [ -z "${CUDA_HOME_SELECTED}" ] &&
+   [ "${TORCH_CUDA}" = "13.0" ]
+then
+
+    info "System CUDA toolkit is missing or mismatched."
+    info "Installing matching CUDA 13.0 compiler/runtime into WanGP env."
+
+    "${WANGP_PYTHON}" -m pip install \
+        --upgrade \
+        "${CUDA_NVCC_PACKAGE}" \
+        "${CUDA_RUNTIME_PACKAGE}" \
+        "${CUDA_CCCL_PACKAGE}"
+
+
+    # Locate NVIDIA pip CUDA toolkit.
+    CUDA_HOME_SELECTED="$(
+        "${WANGP_PYTHON}" - <<'PY'
+import glob
+import site
+import os
+
+roots = []
+
+try:
+    roots.extend(site.getsitepackages())
+except Exception:
+    pass
+
+try:
+    roots.append(site.getusersitepackages())
+except Exception:
+    pass
+
+matches = []
+
+for root in roots:
+
+    matches.extend(
+        glob.glob(
+            os.path.join(
+                root,
+                "nvidia",
+                "cuda_nvcc*"
+            )
+        )
+    )
+
+if matches:
+
+    print(matches[0])
+
+PY
+    )"
+
+fi
+
+
+# -----------------------------------------------------------------------------
+# Configure CUDA environment
+# -----------------------------------------------------------------------------
+
+if [ -n "${CUDA_HOME_SELECTED}" ] &&
+   [ -d "${CUDA_HOME_SELECTED}" ]
+then
+
+    export CUDA_HOME="${CUDA_HOME_SELECTED}"
+
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+
+
+    # Pip-installed CUDA packages use:
+    #
+    #   .../site-packages/nvidia/cuda_runtime/include
+    #   .../site-packages/nvidia/cuda_runtime/lib
+    #   .../site-packages/nvidia/cuda_cccl/include
+    #
+    # Add them when present.
+    NVIDIA_ROOT="$(
+        "${WANGP_PYTHON}" - <<'PY'
+import os
+import site
+
+for root in site.getsitepackages():
+
+    candidate = os.path.join(root, "nvidia")
+
+    if os.path.isdir(candidate):
+
+        print(candidate)
+        break
+
+PY
+    )"
+
+
+    CUDA_INCLUDE_PATHS=""
+
+    for include_dir in \
+        "${NVIDIA_ROOT}/cuda_runtime/include" \
+        "${NVIDIA_ROOT}/cuda_cccl/include" \
+        "${CUDA_HOME}/include"
+    do
+
+        if [ -d "${include_dir}" ]; then
+
+            if [ -n "${CUDA_INCLUDE_PATHS}" ]; then
+                CUDA_INCLUDE_PATHS="${CUDA_INCLUDE_PATHS}:"
+            fi
+
+            CUDA_INCLUDE_PATHS="${CUDA_INCLUDE_PATHS}${include_dir}"
+
+        fi
+
+    done
+
+
+    if [ -n "${CUDA_INCLUDE_PATHS}" ]; then
+
+        if [ -n "${CPATH:-}" ]; then
+            export CPATH="${CUDA_INCLUDE_PATHS}:${CPATH}"
+        else
+            export CPATH="${CUDA_INCLUDE_PATHS}"
+        fi
+
+    fi
+
+
+    CUDA_LIBRARY_PATHS=""
+
+    for lib_dir in \
+        "${NVIDIA_ROOT}/cuda_runtime/lib" \
+        "${CUDA_HOME}/lib64" \
+        "${CUDA_HOME}/lib"
+    do
+
+        if [ -d "${lib_dir}" ]; then
+
+            if [ -n "${CUDA_LIBRARY_PATHS}" ]; then
+                CUDA_LIBRARY_PATHS="${CUDA_LIBRARY_PATHS}:"
+            fi
+
+            CUDA_LIBRARY_PATHS="${CUDA_LIBRARY_PATHS}${lib_dir}"
+
+        fi
+
+    done
+
+
+    if [ -n "${CUDA_LIBRARY_PATHS}" ]; then
+
+        if [ -n "${LIBRARY_PATH:-}" ]; then
+            export LIBRARY_PATH="${CUDA_LIBRARY_PATHS}:${LIBRARY_PATH}"
+        else
+            export LIBRARY_PATH="${CUDA_LIBRARY_PATHS}"
+        fi
+
+        if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            export LD_LIBRARY_PATH="${CUDA_LIBRARY_PATHS}:${LD_LIBRARY_PATH}"
+        else
+            export LD_LIBRARY_PATH="${CUDA_LIBRARY_PATHS}"
+        fi
+
+    fi
+
+fi
+
+
+# =============================================================================
+# Verify nvcc AFTER repair
+# =============================================================================
+
+if command -v nvcc >/dev/null 2>&1; then
+
+    FINAL_NVCC="$(
+        nvcc --version 2>/dev/null |
+        grep -oE 'release [0-9]+\.[0-9]+' |
+        head -n1 |
+        awk '{print $2}' ||
+        echo ""
+    )
+
+else
+
+    FINAL_NVCC=""
+
+fi
+
+
+echo
+echo "CUDA environment:"
+echo "  PyTorch CUDA: ${TORCH_CUDA}"
+echo "  nvcc CUDA:    ${FINAL_NVCC:-not found}"
+echo "  CUDA_HOME:    ${CUDA_HOME:-not set}"
+
+
+if [ "${SAGE_REQUIRED}" != "none" ]; then
+
+    [ -n "${FINAL_NVCC}" ] || \
+        die "SageAttention requires nvcc, but no CUDA compiler is available."
+
+    [ "${FINAL_NVCC}" = "${TORCH_CUDA}" ] || \
+        die "CUDA mismatch remains after automatic repair: PyTorch=${TORCH_CUDA}, nvcc=${FINAL_NVCC}"
+
+    ok "PyTorch CUDA and nvcc CUDA match."
+
+fi
+
+
+# =============================================================================
+# 6. SageAttention
+# =============================================================================
+
+log "[6/9] Installing / verifying SageAttention"
 
 
 if [ "${SAGE_REQUIRED}" = "none" ]; then
 
-    echo "[INFO] SageAttention is not supported for this GPU profile."
+    info "SageAttention is not required for this GPU profile."
 
 else
 
-    SAGE_VERSION="$(
-        "${WANGP_PYTHON}" -c \
-        'import sageattention; print(getattr(sageattention, "__version__", "unknown"))' \
-        2>/dev/null || echo "missing"
-    )
+    # -------------------------------------------------------------------------
+    # Check whether Sage already works in the SELECTED environment.
+    # -------------------------------------------------------------------------
+
+    SAGE_IMPORT="no"
+
+    if "${WANGP_PYTHON}" \
+        -c 'import sageattention' >/dev/null 2>&1
+    then
+
+        SAGE_IMPORT="yes"
+
+        ok "SageAttention already imports in selected environment."
+
+    fi
 
 
-    if [ "${SAGE_REQUIRED}" = "1.0.6" ]; then
+    if [ "${SAGE_IMPORT}" = "no" ]; then
 
-        if [ "${SAGE_VERSION}" != "1.0.6" ]; then
+        if [ "${SAGE_REQUIRED}" = "1.0.6" ]; then
 
-            echo "[INFO] Installing SageAttention 1.0.6..."
+            info "Installing SageAttention 1.0.6..."
 
             "${WANGP_PYTHON}" -m pip install \
                 --upgrade \
@@ -600,263 +1042,171 @@ else
 
         else
 
-            echo "[OK] SageAttention 1.0.6 already installed."
+            info "Installing SageAttention 2.2.0..."
 
-        fi
+            # WanGP's own Linux installation recipe requires these versions.
+            "${WANGP_PYTHON}" -m pip install \
+                "setuptools<=75.8.2" \
+                ninja \
+                wheel \
+                --force-reinstall
 
-    else
 
-        # ---------------------------------------------------------------------
-        # WanGP's own setup_config.json says:
-        #
-        # Linux:
-        #
-        # setuptools<=75.8.2
-        # ninja
-        # wheel
-        # git clone SageAttention
-        # pip install --no-build-isolation -e SageAttention
-        #
-        # This is exactly what we use.
-        # ---------------------------------------------------------------------
+            SAGE_DIR="/tmp/SageAttention"
 
-        echo "[INFO] SageAttention 2.2.0 required."
+            rm -rf "${SAGE_DIR}"
 
-        "${WANGP_PYTHON}" -m pip install \
-            "setuptools<=75.8.2" \
-            ninja \
-            wheel \
-            --force-reinstall
+            git clone \
+                --depth 1 \
+                --branch main \
+                "${SAGE_REPO}" \
+                "${SAGE_DIR}"
 
 
-        SAGE_DIR="/tmp/SageAttention"
+            cd "${SAGE_DIR}"
 
-        rm -rf "${SAGE_DIR}"
 
-        git clone \
-            --depth 1 \
-            --branch main \
-            https://github.com/thu-ml/SageAttention.git \
-            "${SAGE_DIR}"
-
-
-        cd "${SAGE_DIR}"
-
-
-        echo "[INFO] Building/installing SageAttention 2..."
-
-        "${WANGP_PYTHON}" -m pip install \
-            --no-build-isolation \
-            -e .
-
-
-        cd "${WANGP_DIR}"
-
-    fi
-
-fi
-
-
-# -----------------------------------------------------------------------------
-# Verify SageAttention
-# -----------------------------------------------------------------------------
-
-if [ "${SAGE_REQUIRED}" != "none" ]; then
-
-    "${WANGP_PYTHON}" - <<'PY'
-
-import sageattention
-
-print("[OK] SageAttention imported successfully.")
-print("[OK] Location:", sageattention.__file__)
-
-PY
-
-fi
-
-
-# =============================================================================
-# 6. INT4 / FP4 kernels
-# =============================================================================
-
-# =============================================================================
-# INT4 / FP4 SAFETY CHECK
-#
-# IMPORTANT:
-# Before installing Nunchaku / Light2xv into a new environment, inspect the
-# original Vast environment (/venv/main).
-#
-# If Vast already provides a working INT4/FP4 stack, reuse /venv/main instead
-# of installing a second copy.
-# =============================================================================
-
-log "[6/8] Checking existing INT4 / FP4 support"
-
-
-ORIGINAL_ENV="/venv/main"
-
-ORIGINAL_NUNCHAKU_OK="no"
-ORIGINAL_LIGHT2XV_OK="no"
-
-
-# =============================================================================
-# Check original Vast environment for Nunchaku
-# =============================================================================
-
-if [ -x "${ORIGINAL_ENV}/bin/python" ]; then
-
-    echo "[INFO] Checking original Vast environment:"
-    echo "       ${ORIGINAL_ENV}"
-
-
-    if "${ORIGINAL_ENV}/bin/python" -c "import nunchaku" >/dev/null 2>&1; then
-
-        echo "[OK] Nunchaku package exists in original Vast environment."
-
-        if "${ORIGINAL_ENV}/bin/python" - <<'PY'
-import torch
-import nunchaku
-
-assert torch.cuda.is_available()
-
-gpu = torch.cuda.get_device_name(0)
-
-print("GPU:", gpu)
-print("Torch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
-print("Nunchaku:", nunchaku.__file__)
-
-PY
-        then
-
-            ORIGINAL_NUNCHAKU_OK="yes"
-
-            echo "[OK] Existing Nunchaku environment is CUDA-usable."
-
-        else
-
-            echo "[WARN] Nunchaku exists but failed CUDA initialization."
-
-        fi
-
-    else
-
-        echo "[INFO] Nunchaku is not installed in original Vast environment."
-
-    fi
-
-else
-
-    echo "[INFO] Original Vast environment does not exist."
-
-fi
-
-
-# =============================================================================
-# RTX 50: check existing Light2xv
-# =============================================================================
-
-if [ "${LIGHT2XV_REQUIRED}" = "yes" ]; then
-
-    echo
-    echo "[INFO] RTX 50 detected — checking existing Light2xv."
-
-
-    if "${ORIGINAL_ENV}/bin/python" -c "import lightx2v" >/dev/null 2>&1; then
-
-        echo "[OK] Light2xv exists in original Vast environment."
-
-
-        if "${ORIGINAL_ENV}/bin/python" - <<'PY'
-import torch
-import lightx2v
-
-assert torch.cuda.is_available()
-
-print("GPU:", torch.cuda.get_device_name(0))
-print("Torch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
-print("Light2xv:", lightx2v.__file__)
-
-PY
-        then
-
-            ORIGINAL_LIGHT2XV_OK="yes"
-
-            echo "[OK] Existing Light2xv environment is CUDA-usable."
-
-        else
-
-            echo "[WARN] Light2xv exists but failed CUDA initialization."
-
-        fi
-
-    else
-
-        echo "[INFO] Light2xv is not installed in original Vast environment."
-
-    fi
-
-fi
-
-
-# =============================================================================
-# Decide whether original Vast environment can be reused
-# =============================================================================
-
-if [ "${ORIGINAL_NUNCHAKU_OK}" = "yes" ]; then
-
-    echo
-    echo "------------------------------------------------------------"
-    echo "[OK] Existing Vast INT4/FP4 stack detected."
-    echo "------------------------------------------------------------"
-    echo
-    echo "Nunchaku is already installed and CUDA-usable in:"
-    echo
-    echo "    ${ORIGINAL_ENV}"
-    echo
-    echo "Skipping Nunchaku installation."
-    echo
-
-
-    # -------------------------------------------------------------------------
-    # IMPORTANT:
-    #
-    # If we are going to reuse /venv/main for WanGP, don't create another
-    # Python environment containing a second Nunchaku installation.
-    # -------------------------------------------------------------------------
-
-    if [ "${WANGP_PYTHON}" != "${ORIGINAL_ENV}/bin/python" ]; then
-
-        echo "[INFO] Switching WanGP back to original Vast environment."
-
-        WANGP_PYTHON="${ORIGINAL_ENV}/bin/python"
-
-    fi
-
-else
-
-    echo
-    echo "[INFO] No usable Nunchaku found in original Vast environment."
-    echo "[INFO] Installing Nunchaku into WanGP environment."
-
-
-    if [ "${NUNCHAKU_REQUIRED}" = "yes" ]; then
-
-        if "${WANGP_PYTHON}" -c "import nunchaku" >/dev/null 2>&1; then
-
-            echo "[OK] Nunchaku already installed in WanGP environment."
-
-        else
-
-            echo "[INFO] Installing Nunchaku..."
+            # CRITICAL:
+            #
+            # --no-build-isolation is required because SageAttention's build
+            # process imports torch.
+            #
+            # Without it:
+            #
+            #   ModuleNotFoundError: No module named 'torch'
+            #
+            # was observed in the Vast environment.
 
             "${WANGP_PYTHON}" -m pip install \
-                "https://github.com/nunchaku-ai/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1+cu13.0torch2.10-cp311-cp311-linux_x86_64.whl"
+                --no-build-isolation \
+                -e .
+
+
+            cd "${WANGP_DIR}"
 
         fi
 
     fi
+
+
+    # -------------------------------------------------------------------------
+    # Verify Sage after installation.
+    # -------------------------------------------------------------------------
+
+    if ! "${WANGP_PYTHON}" \
+        -c 'import sageattention' >/dev/null 2>&1
+    then
+
+        die "SageAttention installation completed but the module cannot be imported."
+
+    fi
+
+
+    SAGE_PATH="$(
+        "${WANGP_PYTHON}" \
+            -c 'import sageattention; print(sageattention.__file__)'
+    )"
+
+
+    ok "SageAttention is installed."
+
+    echo "  Path: ${SAGE_PATH}"
+
+fi
+
+
+# =============================================================================
+# 7. INT4 / FP4 acceleration
+#
+# SAFETY RULE:
+#
+# First inspect /venv/main.
+#
+# If the original environment already has a working Nunchaku/FP4 stack,
+# do NOT modify /venv/main.
+#
+# If we are using /venv/main, don't reinstall it.
+#
+# If we created a clean WanGP environment, it needs its own compatible
+# package because Python environments cannot safely share site-packages.
+# =============================================================================
+
+log "[7/9] Checking INT4 / FP4 acceleration"
+
+
+# =============================================================================
+# Nunchaku
+# =============================================================================
+
+if [ "${NUNCHAKU_REQUIRED}" = "yes" ]; then
+
+    SELECTED_NUNCHAKU="no"
+
+
+    if "${WANGP_PYTHON}" \
+        -c 'import nunchaku' >/dev/null 2>&1
+    then
+
+        SELECTED_NUNCHAKU="yes"
+
+        ok "Nunchaku already exists in selected environment."
+
+    fi
+
+
+    if [ "${SELECTED_NUNCHAKU}" = "no" ]; then
+
+        if [ "${ORIGINAL_NUNCHAKU}" = "yes" ] &&
+           [ "${USE_ORIGINAL_ENV}" = "yes" ]
+        then
+
+            # This should normally be impossible because the selected env is
+            # already /venv/main and the import check above would succeed.
+
+            ok "Reusing existing Nunchaku from original Vast environment."
+
+        else
+
+            if [ "${ORIGINAL_NUNCHAKU}" = "yes" ]; then
+
+                echo
+                echo "[INFO] Original Vast environment has working Nunchaku."
+                echo "[INFO] Selected WanGP environment is different."
+                echo "[INFO] Installing a compatible copy into the isolated env."
+                echo
+
+            else
+
+                info "No usable Nunchaku was found in original Vast environment."
+
+            fi
+
+
+            info "Installing compatible Nunchaku..."
+
+            "${WANGP_PYTHON}" -m pip install \
+                "${NUNCHAKU_WHEEL}"
+
+        fi
+
+    fi
+
+
+    # Final import check.
+    if ! "${WANGP_PYTHON}" \
+        -c 'import nunchaku' >/dev/null 2>&1
+    then
+
+        die "Nunchaku is required for this GPU profile but cannot be imported."
+
+    fi
+
+
+    ok "Nunchaku INT4/FP4 support is available."
+
+else
+
+    info "Nunchaku is not required for this GPU profile."
 
 fi
 
@@ -867,137 +1217,191 @@ fi
 
 if [ "${LIGHT2XV_REQUIRED}" = "yes" ]; then
 
-    echo
-    echo "Checking Light2xv..."
+    if "${WANGP_PYTHON}" \
+        -c 'import lightx2v' >/dev/null 2>&1
+    then
 
+        ok "Light2xv already exists in selected environment."
 
-    if [ "${ORIGINAL_LIGHT2XV_OK}" = "yes" ]; then
+    else
 
-        echo "[OK] Existing Vast Light2xv is usable."
+        if [ "${ORIGINAL_LIGHT2XV}" = "yes" ] &&
+           [ "${USE_ORIGINAL_ENV}" = "yes" ]
+        then
 
-        if [ "${WANGP_PYTHON}" != "${ORIGINAL_ENV}/bin/python" ]; then
-
-            echo "[WARN] Light2xv exists in /venv/main but WanGP is using another env."
-
-            echo "[INFO] Installing Light2xv into WanGP environment as well."
+            ok "Reusing existing Light2xv from original Vast environment."
 
         else
 
-            echo "[OK] Reusing original Light2xv."
+            if [ "${ORIGINAL_LIGHT2XV}" = "yes" ]; then
+
+                echo
+                echo "[INFO] Original Vast environment already has Light2xv."
+                echo "[INFO] Selected environment is isolated."
+                echo "[INFO] Installing compatible Light2xv there."
+                echo
+
+            else
+
+                info "Light2xv is not present in original environment."
+
+            fi
+
+
+            info "Installing Light2xv NVFP4 kernel..."
+
+            "${WANGP_PYTHON}" -m pip install \
+                "${LIGHT2XV_WHEEL}"
 
         fi
 
     fi
 
 
-    # Install only if the selected WanGP environment does not already provide
-    # Light2xv.
+    if ! "${WANGP_PYTHON}" \
+        -c 'import lightx2v' >/dev/null 2>&1
+    then
 
-    if ! "${WANGP_PYTHON}" -c "import lightx2v" >/dev/null 2>&1; then
-
-        echo "[INFO] Installing Light2xv NVFP4 kernel..."
-
-        "${WANGP_PYTHON}" -m pip install \
-            "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl"
-
-    else
-
-        echo "[OK] Light2xv already available in selected environment."
+        die "Light2xv is required for the RTX 50 profile but cannot be imported."
 
     fi
 
+
+    ok "Light2xv is available."
+
 fi
 
- 
 
 # =============================================================================
-# 7. Verify entire acceleration environment
+# 8. Final environment verification
 # =============================================================================
 
-log "[7/8] Final acceleration verification"
+log "[8/9] Final acceleration verification"
 
 
 "${WANGP_PYTHON}" - <<'PY'
 
 import sys
 
-print("Python:", sys.version)
+print("Python:")
+print(" ", sys.version)
+
+print()
 
 try:
+
     import torch
 
-    print("PyTorch:", torch.__version__)
-    print("Torch CUDA:", torch.version.cuda)
+    print("PyTorch:")
+    print(" ", torch.__version__)
+
+    print("PyTorch CUDA:")
+    print(" ", torch.version.cuda)
+
+    print("CUDA available:")
+    print(" ", torch.cuda.is_available())
 
     if torch.cuda.is_available():
 
-        print("GPU:", torch.cuda.get_device_name(0))
-        print("CUDA:", torch.cuda.get_device_capability(0))
+        print("GPU:")
+        print(" ", torch.cuda.get_device_name(0))
+
+        print("Compute capability:")
+        print(" ", torch.cuda.get_device_capability(0))
 
 except Exception as e:
 
-    print("PyTorch ERROR:", e)
+    raise SystemExit(f"PyTorch verification failed: {e}")
 
 
 try:
 
     import triton
 
-    print("Triton:", triton.__version__)
+    print("Triton:")
+    print(" ", triton.__version__)
 
-except Exception as e:
+except Exception:
 
-    print("Triton: NOT AVAILABLE")
+    print("Triton: not installed")
 
 
 try:
 
     import sageattention
 
-    print("SageAttention: INSTALLED")
-    print("SageAttention path:", sageattention.__file__)
+    print("SageAttention:")
+    print(" INSTALLED")
+    print(" ", sageattention.__file__)
 
-except Exception as e:
+except Exception:
 
-    print("SageAttention: NOT AVAILABLE")
-    print("Error:", e)
+    print("SageAttention: not installed")
 
 
 try:
 
     import nunchaku
 
-    print("Nunchaku: INSTALLED")
+    print("Nunchaku:")
+    print(" INSTALLED")
 
-except Exception as e:
+except Exception:
 
-    print("Nunchaku: NOT AVAILABLE")
-    print("Error:", e)
+    print("Nunchaku: not installed")
 
 
 try:
 
     import lightx2v
 
-    print("Light2xv: INSTALLED")
+    print("Light2xv:")
+    print(" INSTALLED")
 
 except Exception:
 
-    print("Light2xv: not installed / not required")
-
+    print("Light2xv: not installed")
 
 PY
 
 
 # =============================================================================
-# Verify SageAttention before continuing
+# Hard verification gates
 # =============================================================================
 
 if [ "${SAGE_REQUIRED}" != "none" ]; then
 
-    if ! "${WANGP_PYTHON}" -c "import sageattention" >/dev/null 2>&1; then
+    if ! "${WANGP_PYTHON}" \
+        -c 'import sageattention' >/dev/null 2>&1
+    then
 
-        die "SageAttention installation failed. WanGP will NOT be started."
+        die "Final SageAttention verification failed."
+
+    fi
+
+fi
+
+
+if [ "${NUNCHAKU_REQUIRED}" = "yes" ]; then
+
+    if ! "${WANGP_PYTHON}" \
+        -c 'import nunchaku' >/dev/null 2>&1
+    then
+
+        die "Final Nunchaku verification failed."
+
+    fi
+
+fi
+
+
+if [ "${LIGHT2XV_REQUIRED}" = "yes" ]; then
+
+    if ! "${WANGP_PYTHON}" \
+        -c 'import lightx2v' >/dev/null 2>&1
+    then
+
+        die "Final Light2xv verification failed."
 
     fi
 
@@ -1005,66 +1409,145 @@ fi
 
 
 # =============================================================================
-# Verify WanGP CLI
+# Verify WanGP CLI and supported flags
 # =============================================================================
 
 echo
-echo "Checking WanGP CLI..."
+echo "=== Verifying installed WanGP CLI ==="
 
-"${WANGP_PYTHON}" \
-    "${WANGP_DIR}/wgp.py" \
-    --help >/dev/null
+CLI_HELP="$(
+    "${WANGP_PYTHON}" \
+        "${WANGP_DIR}/wgp.py" \
+        --help \
+        2>&1
+)"
 
 
-echo "[OK] WanGP CLI works."
+echo "WanGP commit: ${WANGP_COMMIT}"
+echo "Python: ${WANGP_PYTHON}"
+"${WANGP_PYTHON}" --version
+
+
+check_flag() {
+
+    local flag="$1"
+
+    if echo "${CLI_HELP}" | grep -q -- "${flag}"; then
+
+        echo "[OK] ${flag} supported"
+
+        return 0
+
+    else
+
+        echo "[WARN] ${flag} NOT supported"
+
+        return 1
+
+    fi
+
+}
+
+
+check_flag "--profile" || true
+check_flag "--perc-reserved-mem-max" || true
+check_flag "--attention" || true
+check_flag "--compile" || true
+
+
+# TeaCache deliberately NOT used.
+#
+# We do not even probe/use it in the launch command because your actual
+# WanGP build does not expose --teacache.
+
+echo "[INFO] TeaCache: not requested / not passed to WanGP."
 
 
 # =============================================================================
-# 8. Patch supervisor
+# Verify required attention option
 # =============================================================================
 
-log "[8/8] Configuring WanGP supervisor"
+if ! echo "${CLI_HELP}" |
+    grep -q -- "--attention"
+then
 
-
-if [ ! -f "${LAUNCH_FILE}" ]; then
-
-    die "WanGP supervisor launcher not found: ${LAUNCH_FILE}"
+    die "This WanGP build does not expose --attention."
 
 fi
 
 
+# =============================================================================
+# 9. Configure Supervisor
+# =============================================================================
+
+log "[9/9] Configuring WanGP supervisor"
+
+
+[ -f "${SUPERVISOR_FILE}" ] || \
+    die "Supervisor launcher not found: ${SUPERVISOR_FILE}"
+
+
 echo "--- BEFORE ---"
-cat "${LAUNCH_FILE}"
-
-
-# -----------------------------------------------------------------------------
-# Replace Python activation / executable.
-#
-# This is important because Vast originally points at /venv/main.
-# We point it at the environment selected above.
-# -----------------------------------------------------------------------------
-
-sed -i \
-    "s|/venv/main/bin/activate|${WANGP_PYTHON%/bin/python}/bin/activate|g" \
-    "${LAUNCH_FILE}"
-
-
-# Replace Python executable.
-sed -i \
-    -E \
-    "s|python wgp\.py.*|${WANGP_PYTHON} wgp.py --profile 2 --perc-reserved-mem-max 0.50 --attention sage2 --compile 2>\&1|" \
-    "${LAUNCH_FILE}"
-
-
-chmod +x "${LAUNCH_FILE}"
-
-
-echo "--- AFTER ---"
-cat "${LAUNCH_FILE}"
+cat "${SUPERVISOR_FILE}"
 
 
 # =============================================================================
-# Refresh supervisor
+# Build clean supervisor wrapper
+#
+# We deliberately DO NOT rely on /venv/main activation.
+#
+# We directly invoke the locked Python executable.
+#
+# This prevents the previous bug where the script installed packages into one
+# environment and then silently changed WANGP_PYTHON back to /venv/main.
+# =============================================================================
+
+cat > "${SUPERVISOR_FILE}" <<EOF
+#!/bin/bash
+
+utils=/opt/supervisor-scripts/utils
+
+. "\${utils}/logging.sh"
+. "\${utils}/cleanup_generic.sh"
+. "\${utils}/environment.sh"
+. "\${utils}/exit_serverless.sh"
+. "\${utils}/exit_portal.sh" "Wan2GP"
+
+echo "Starting Wan2GP"
+
+. /etc/environment
+
+cd "${WANGP_DIR}"
+
+export XDG_RUNTIME_DIR=/tmp
+export SDL_AUDIODRIVER=dummy
+
+export CUDA_HOME="${CUDA_HOME:-}"
+export PATH="${CUDA_HOME:+${CUDA_HOME}/bin:}\$PATH"
+
+export CPATH="${CPATH:-}"
+export LIBRARY_PATH="${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
+exec "${WANGP_PYTHON}" \
+    wgp.py \
+    --profile 2 \
+    --perc-reserved-mem-max 0.50 \
+    --attention "${ATTENTION_MODE}" \
+    --compile \
+    2>&1
+EOF
+
+
+chmod +x "${SUPERVISOR_FILE}"
+
+
+echo "--- AFTER ---"
+cat "${SUPERVISOR_FILE}"
+
+
+# =============================================================================
+# Supervisor reload
 # =============================================================================
 
 supervisorctl reread
@@ -1083,7 +1566,7 @@ mkdir -p "${WANGP_DIR}/finetunes"
 # MiniMax H3 T2V
 # =============================================================================
 
-cat > "${WANGP_DIR}/finetunes/minimax_h3_t2v_int8.json" << 'EOF'
+cat > "${WANGP_DIR}/finetunes/minimax_h3_t2v_int8.json" <<'EOF'
 {
   "id": "minimax_h3_t2v_int8",
   "name": "MiniMax H3 FL2VA T2V — INT8 DiT + Heretic NVFP4",
@@ -1102,7 +1585,7 @@ EOF
 # MiniMax H3 I2V
 # =============================================================================
 
-cat > "${WANGP_DIR}/finetunes/minimax_h3_i2v_int8.json" << 'EOF'
+cat > "${WANGP_DIR}/finetunes/minimax_h3_i2v_int8.json" <<'EOF'
 {
   "id": "minimax_h3_i2v_int8",
   "name": "MiniMax H3 Ref2VA I2V — INT8 DiT + Heretic NVFP4",
@@ -1121,43 +1604,50 @@ EOF
 # Wan2.2 Animate 14B
 #
 # IMPORTANT:
-# This is an architecture-specific finetune.
+# We use the CURRENT upstream Animate architecture and override only the
+# text encoder.
 #
-# The custom T5 is:
-#
-# dummy9996/6NSFW-Wan-UMT5-XXL-mxfp8-nvfp4-int4-convrot
-#
-# Actual file:
-#
-# nsfw_wan_umt5-xxl-nvfp4.safetensors
+# No weights are downloaded during provisioning.
 # =============================================================================
 
-cat > "${WANGP_DIR}/finetunes/wan22_animate_14b_custom_t5.json" << 'EOF'
+cat > "${WANGP_DIR}/finetunes/wan22_animate_14b_custom_t5.json" <<'EOF'
 {
-  "id": "wan22_animate_14b_custom_t5",
-  "name": "Wan2.2 Animate 14B — Custom NSFW T5 NVFP4",
-  "description": "Wan2.2 Animate 14B with custom NVFP4 UMT5-XXL text encoder.",
   "model": {
+    "name": "Wan2.2 Animate 14B — Custom UMT5 NVFP4",
     "architecture": "animate",
+    "description": "Wan2.2 Animate 14B using the custom NVFP4 UMT5-XXL text encoder.",
+    "URLs": [
+      "https://huggingface.co/DeepBeepMeep/Wan2.2/resolve/main/wan2.2_animate_14B_bf16.safetensors",
+      "https://huggingface.co/DeepBeepMeep/Wan2.2/resolve/main/wan2.2_animate_14B_quanto_fp16_int8.safetensors",
+      "https://huggingface.co/DeepBeepMeep/Wan2.2/resolve/main/wan2.2_animate_14B_quanto_bf16_int8.safetensors"
+    ],
     "text_encoder_URLs": [
       "https://huggingface.co/dummy9996/6NSFW-Wan-UMT5-XXL-mxfp8-nvfp4-int4-convrot/resolve/main/nsfw_wan_umt5-xxl-nvfp4.safetensors"
-    ]
+    ],
+    "group": "wan2_2"
   }
 }
 EOF
 
 
 # =============================================================================
-# Bernini-R
+# Bernini-R NVFP4
+#
+# High-noise:
+#   wan2.2_bernini_r_high_noise_nvfp4.safetensors
+#
+# Low-noise:
+#   wan2.2_bernini_r_low_noise_nvfp4.safetensors
+#
+# Both filenames are from rzgar/Bernini-R-nvfp4.
 # =============================================================================
 
-cat > "${WANGP_DIR}/finetunes/bernini_r_nvfp4_custom_t5.json" << 'EOF'
+cat > "${WANGP_DIR}/finetunes/bernini_r_nvfp4_custom_t5.json" <<'EOF'
 {
-  "id": "bernini_r_nvfp4_custom_t5",
-  "name": "Bernini-R — NVFP4 + Custom NSFW T5",
-  "description": "Bernini-R using NVFP4 high/low-noise checkpoints and custom NVFP4 UMT5-XXL.",
   "model": {
+    "name": "Wan2.2 Bernini-R 14B — NVFP4 + Custom UMT5",
     "architecture": "bernini",
+    "description": "Wan2.2 Bernini-R using NVFP4 high/low-noise weights and custom NVFP4 UMT5-XXL text encoder.",
     "URLs": [
       "https://huggingface.co/rzgar/Bernini-R-nvfp4/resolve/main/wan2.2_bernini_r_high_noise_nvfp4.safetensors"
     ],
@@ -1166,18 +1656,35 @@ cat > "${WANGP_DIR}/finetunes/bernini_r_nvfp4_custom_t5.json" << 'EOF'
     ],
     "text_encoder_URLs": [
       "https://huggingface.co/dummy9996/6NSFW-Wan-UMT5-XXL-mxfp8-nvfp4-int4-convrot/resolve/main/nsfw_wan_umt5-xxl-nvfp4.safetensors"
-    ]
-  }
+    ],
+    "group": "wan2_2"
+  },
+  "prompt": "Replace the person's outer shirt with the shirt from the reference image while preserving the original motion, camera framing, lighting, background, and body pose.",
+  "video_prompt_type": "VI",
+  "resolution": "832x480",
+  "video_length": 81,
+  "num_inference_steps": 40,
+  "sample_solver": "unipc",
+  "flow_shift": 5,
+  "guidance_phases": 2,
+  "model_switch_phase": 1,
+  "switch_threshold": 875,
+  "guidance_scale": 4,
+  "guidance2_scale": 4,
+  "control_net_weight": 1.25,
+  "alt_guidance_scale": 4.5,
+  "remove_background_images_ref": 0,
+  "prompt_enhancer": ""
 }
 EOF
 
 
 # =============================================================================
-# Validate JSON
+# Validate JSON files
 # =============================================================================
 
 echo
-echo "Validating finetune JSON..."
+echo "=== Validating finetune JSONs ==="
 
 for file in \
     "${WANGP_DIR}/finetunes/minimax_h3_t2v_int8.json" \
@@ -1186,15 +1693,32 @@ for file in \
     "${WANGP_DIR}/finetunes/bernini_r_nvfp4_custom_t5.json"
 do
 
-    python -m json.tool "${file}" >/dev/null
+    "${WANGP_PYTHON}" \
+        -m json.tool \
+        "${file}" >/dev/null
 
-    echo "[OK] ${file}"
+    ok "$(basename "${file}")"
 
 done
 
 
 # =============================================================================
-# Start Wan2GP
+# IMPORTANT:
+# Do NOT pre-download any model.
+#
+# The finetune JSONs contain URLs only.
+# WanGP downloads the selected checkpoint when the user selects that model.
+# =============================================================================
+
+echo
+echo "=== Model download policy ==="
+echo "[OK] No model weights were pre-seeded."
+echo "[OK] All configured models are ON-DEMAND."
+echo "[OK] Finetune JSONs only."
+
+
+# =============================================================================
+# Start WanGP
 # =============================================================================
 
 echo
@@ -1204,42 +1728,62 @@ supervisorctl start wan2gp
 
 
 # =============================================================================
-# Final
+# Final status
 # =============================================================================
 
 echo
 echo "============================================================"
-echo "           Wan2GP provisioning COMPLETE"
+echo "       Custom WanGP provisioning COMPLETE"
 echo "============================================================"
+
 echo
 echo "GPU:"
 echo "  ${GPU_NAME}"
 echo "  Profile: ${GPU_PROFILE}"
+
 echo
 echo "Environment:"
-echo "  Python:       ${PYTHON_MAJOR}"
+echo "  Python:       ${WANGP_PYTHON}"
+echo "  Python ver:   ${PYTHON_MAJOR}"
 echo "  PyTorch:      ${TORCH_SPEC}"
-echo "  CUDA wheel:   ${TORCH_INDEX_URL}"
+echo "  Torch CUDA:   ${TORCH_CUDA}"
+echo "  CUDA_HOME:    ${CUDA_HOME:-system/default}"
+
+echo
+echo "Attention:"
+echo "  Mode:         ${ATTENTION_MODE}"
+echo "  Sage:         ${SAGE_REQUIRED}"
+
 echo
 echo "Acceleration:"
-echo "  Triton:       ${TRITON_SPEC:-none}"
-echo "  Sage:         ${SAGE_REQUIRED}"
+echo "  Triton:       ${TRITON_REQUIRED}"
 echo "  Nunchaku:     ${NUNCHAKU_REQUIRED}"
 echo "  Light2xv:     ${LIGHT2XV_REQUIRED}"
+
 echo
 echo "WanGP:"
-echo "  Profile:      2"
-echo "  Attention:    sage2"
-echo "  Compilation:  ON"
+echo "  Commit:       ${WANGP_COMMIT}"
+echo "  Profile:      2 (HighRAM_LowVRAM)"
+echo "  VRAM ceiling: 50%"
+echo "  Compile:      ON"
+echo "  TeaCache:     OFF / not passed"
+
 echo
-echo "Models:"
+echo "Model downloads:"
 echo "  Pre-seeding:  OFF"
 echo "  H3 T2V:       ON-DEMAND"
 echo "  H3 I2V:       ON-DEMAND"
 echo "  Animate 14B:  ON-DEMAND"
 echo "  Bernini-R:    ON-DEMAND"
+
 echo
-echo "T5:"
+echo "Custom T5:"
 echo "  nsfw_wan_umt5-xxl-nvfp4.safetensors"
+
+echo
+echo "Custom models:"
+echo "  Wan2.2 Animate 14B"
+echo "  Wan2.2 Bernini-R NVFP4"
+
 echo
 echo "============================================================"
